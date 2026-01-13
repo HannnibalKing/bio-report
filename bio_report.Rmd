@@ -1,0 +1,340 @@
+---
+title: "Bioinformatics-Style Mini Report"
+author: "Automated Analysis"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+# Overview
+This short report demonstrates a tidyverse-driven workflow on a toy bioinformatics-style RNA-seq expression dataset. We will:
+
+- simulate and clean a small dataset (two conditions: Treatment vs Control)
+- perform quality checks (boxplots, PCA)
+- run gene-level tests via Welch t-tests and limma
+- explore multiple-testing behavior and enrichment
+- add interactivity (DT, plotly) and show a reproducible workflow sketch
+- provide a concise scientific interpretation
+
+# Load packages
+```{r}
+library(tidyverse)
+library(broom)
+library(glue)
+library(limma)
+library(DT)
+library(plotly)
+library(pwr)
+```
+
+# Simulate a small expression dataset
+For reproducibility, we simulate 12 samples (6 Control, 6 Treatment) and 10 genes. Treatment samples have an average 1.5x upregulation for genes G4 and G7 to create a detectable effect.
+
+```{r}
+set.seed(42)
+
+samples <- tibble(
+  sample_id = glue::glue("S{sprintf('%02d', 1:12)}"),
+  condition = rep(c("Control", "Treatment"), each = 6)
+)
+
+genes <- tibble(gene = paste0("G", 1:10))
+
+# baseline expression and treatment effect
+base_means <- runif(nrow(genes), min = 8, max = 14)
+
+treatment_effect <- case_when(
+  genes$gene %in% c("G4", "G7") ~ log2(1.5),
+  TRUE ~ 0
+)
+
+# simulate log2 CPM expression matrix
+expr <- map_dfr(seq_len(nrow(samples)), function(i) {
+  tibble(
+    sample_id = samples$sample_id[i],
+    gene = genes$gene,
+    log2_cpm = rnorm(
+      n = nrow(genes),
+      mean = base_means + if_else(samples$condition[i] == "Treatment", treatment_effect, 0),
+      sd = 0.25
+    )
+  )
+}) %>%
+  left_join(samples, by = "sample_id")
+
+expr %>% head()
+```
+
+# Data cleaning
+We demonstrate simple cleaning steps: remove any missing values, ensure factors are well-ordered, and drop low-expression genes (mean log2 CPM < 9).
+
+```{r}
+clean_expr <- expr %>%
+  drop_na() %>%
+  mutate(condition = factor(condition, levels = c("Control", "Treatment"))) %>%
+  group_by(gene) %>%
+  filter(mean(log2_cpm) >= 9) %>%
+  ungroup()
+
+clean_expr %>% count(gene)
+```
+
+# Sample-level QC
+```{r}
+qc_stats <- clean_expr %>%
+  group_by(sample_id, condition) %>%
+  summarise(mean_log2 = mean(log2_cpm), sd_log2 = sd(log2_cpm), .groups = "drop")
+
+qc_stats
+```
+
+```{r fig.width=6, fig.height=4}
+qc_stats %>%
+  ggplot(aes(x = mean_log2, y = sd_log2, color = condition, label = sample_id)) +
+  geom_point(size = 3) +
+  geom_text(nudge_y = 0.015) +
+  labs(title = "Sample QC: mean vs sd", x = "Mean log2 CPM", y = "SD log2 CPM") +
+  theme_minimal(base_size = 11)
+```
+
+# PCA
+```{r fig.width=6, fig.height=4}
+pca_mat <- clean_expr %>%
+  select(sample_id, gene, log2_cpm) %>%
+  pivot_wider(names_from = gene, values_from = log2_cpm) %>%
+  column_to_rownames("sample_id") %>%
+  as.matrix()
+
+pca <- prcomp(pca_mat, scale. = TRUE)
+
+pca_scores <- pca$x %>%
+  as_tibble(rownames = "sample_id") %>%
+  left_join(samples, by = "sample_id")
+
+var_exp <- pca$sdev^2 / sum(pca$sdev^2)
+
+p1 <- pca_scores %>%
+  ggplot(aes(PC1, PC2, color = condition, label = sample_id)) +
+  geom_point(size = 3) +
+  geom_text(nudge_y = 0.3) +
+  labs(title = "PCA of samples", subtitle = paste0("Var exp PC1=", round(100 * var_exp[1], 1), "%, PC2=", round(100 * var_exp[2], 1), "%")) +
+  theme_minimal(base_size = 11)
+
+p2 <- tibble(PC = paste0("PC", seq_along(var_exp)), var = var_exp) %>%
+  slice_head(n = 5) %>%
+  ggplot(aes(x = PC, y = var)) +
+  geom_col(fill = "steelblue") +
+  scale_y_continuous(labels = scales::percent_format()) +
+  labs(title = "Scree plot", y = "Variance explained", x = NULL) +
+  theme_minimal(base_size = 11)
+
+p1
+p2
+```
+
+# Exploratory plots
+```{r fig.width=7, fig.height=4}
+# Boxplot per gene faceted by condition
+clean_expr %>%
+  ggplot(aes(x = condition, y = log2_cpm, fill = condition)) +
+  geom_boxplot(outlier.alpha = 0.5) +
+  facet_wrap(~ gene, nrow = 2) +
+  scale_fill_manual(values = c("#4B5563", "#2DD4BF")) +
+  labs(title = "Gene expression by condition", y = "log2 CPM", x = NULL) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "none")
+```
+
+```{r fig.width=6, fig.height=4}
+# Mean difference plot
+clean_expr %>%
+  group_by(gene, condition) %>%
+  summarise(mean_log2 = mean(log2_cpm), .groups = "drop") %>%
+  pivot_wider(names_from = condition, values_from = mean_log2) %>%
+  mutate(diff = Treatment - Control) %>%
+  ggplot(aes(x = Control, y = Treatment, label = gene)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "gray50") +
+  geom_point(color = "steelblue", size = 3) +
+  geom_text(nudge_y = 0.05, size = 3) +
+  labs(title = "Mean log2 CPM per gene", x = "Control", y = "Treatment") +
+  theme_minimal(base_size = 11)
+```
+
+# Hypothesis testing (two-sample t-tests per gene)
+We test for differences in mean log2 CPM between Treatment and Control for each gene using Welch t-tests and adjust p-values with Benjamini-Hochberg.
+
+```{r}
+ttest_results <- clean_expr %>%
+  group_by(gene) %>%
+  do(tidy(t.test(log2_cpm ~ condition, data = .))) %>%
+  ungroup() %>%
+  mutate(p_adj = p.adjust(p.value, method = "BH")) %>%
+  arrange(p_adj)
+
+ttest_results %>% select(gene, estimate1, estimate2, statistic, p.value, p_adj)
+```
+
+# Linear model (limma)
+```{r}
+design <- model.matrix(~ condition, data = samples)
+
+expr_wide <- clean_expr %>%
+  select(sample_id, gene, log2_cpm) %>%
+  pivot_wider(names_from = sample_id, values_from = log2_cpm) %>%
+  column_to_rownames("gene") %>%
+  as.matrix()
+
+fit <- lmFit(expr_wide, design) %>% eBayes()
+limma_res <- topTable(fit, coef = "conditionTreatment", number = Inf) %>%
+  rownames_to_column("gene")
+
+limma_res %>% select(gene, logFC, AveExpr, t, P.Value, adj.P.Val)
+```
+
+# Multiple-testing behavior
+```{r fig.width=6, fig.height=4}
+ttest_results %>%
+  ggplot(aes(x = p.value)) +
+  geom_histogram(bins = 20, fill = "gray70", color = "white") +
+  labs(title = "P-value histogram", x = "Raw p-value", y = "Count") +
+  theme_minimal(base_size = 11)
+```
+
+```{r fig.width=6, fig.height=4}
+observed <- sort(ttest_results$p.value)
+expected <- ppoints(length(observed))
+tibble(expected = expected, observed = observed) %>%
+  ggplot(aes(x = -log10(expected), y = -log10(observed))) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "gray60") +
+  geom_point(color = "steelblue", size = 2.5) +
+  labs(title = "P-value QQ plot", x = "-log10 expected", y = "-log10 observed") +
+  theme_minimal(base_size = 11)
+```
+
+```{r}
+datatable(ttest_results %>% mutate(effect = estimate2 - estimate1) %>% select(gene, effect, p.value, p_adj),
+          options = list(pageLength = 10),
+          caption = "Interactive results table (Welch t-tests)")
+```
+
+```{r fig.width=6, fig.height=4}
+# Volcano-style plot (effect size vs adjusted p-value)
+ttest_results %>%
+  mutate(effect = estimate2 - estimate1) %>%
+  ggplot(aes(x = effect, y = -log10(p_adj), label = gene)) +
+  geom_hline(yintercept = -log10(0.05), linetype = "dotted", color = "gray60") +
+  geom_point(aes(color = p_adj < 0.05), size = 3) +
+  scale_color_manual(values = c("FALSE" = "gray50", "TRUE" = "tomato")) +
+  geom_text(nudge_y = 0.1, size = 3) +
+  labs(title = "Differential expression signal", x = "Treatment - Control (log2)", y = "-log10 adjusted p-value", color = "Significant") +
+  theme_minimal(base_size = 11)
+```
+
+# Interactive plots
+```{r}
+volcano_plot <- ttest_results %>%
+  mutate(effect = estimate2 - estimate1) %>%
+  ggplot(aes(x = effect, y = -log10(p_adj), color = p_adj < 0.05, text = paste0("Gene: ", gene, "\nEffect: ", round(effect, 2), "\nBH p: ", signif(p_adj, 3)))) +
+  geom_point(size = 3) +
+  scale_color_manual(values = c("FALSE" = "gray60", "TRUE" = "tomato")) +
+  labs(title = "Interactive volcano", x = "Treatment - Control (log2)", y = "-log10 BH p") +
+  theme_minimal(base_size = 11)
+
+ggplotly(volcano_plot, tooltip = "text")
+```
+
+```{r}
+gene_boxes <- clean_expr %>%
+  ggplot(aes(condition, log2_cpm, fill = condition, text = paste0("Sample: ", sample_id, "\nGene: ", gene, "\nValue: ", round(log2_cpm, 2)))) +
+  geom_boxplot(outlier.alpha = 0.4) +
+  facet_wrap(~ gene) +
+  scale_fill_manual(values = c("#4B5563", "#2DD4BF")) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "none")
+
+ggplotly(gene_boxes, tooltip = "text")
+```
+
+# Mock enrichment analysis
+We create simple toy pathways and run over-representation tests using Fisher's exact test to illustrate pathway-level interpretation.
+
+```{r}
+sig_genes <- ttest_results %>% filter(p_adj < 0.05) %>% pull(gene)
+universe <- genes$gene
+
+pathways <- list(
+  Pathway_A = c("G1", "G2", "G3", "G4"),
+  Pathway_B = c("G4", "G5", "G6"),
+  Pathway_C = c("G7", "G8", "G9", "G10")
+)
+
+enrich <- map_dfr(names(pathways), function(pw) {
+  pw_genes <- pathways[[pw]]
+  mat <- matrix(c(
+    sum(sig_genes %in% pw_genes),
+    sum(!(sig_genes %in% pw_genes)),
+    sum(setdiff(universe, sig_genes) %in% pw_genes),
+    sum(!(setdiff(universe, sig_genes) %in% pw_genes))
+  ), nrow = 2)
+  tibble(pathway = pw, p_value = fisher.test(mat)$p.value)
+}) %>%
+  mutate(p_adj = p.adjust(p_value, method = "BH"))
+
+enrich %>% arrange(p_adj)
+```
+
+```{r fig.width=6, fig.height=4}
+enrich %>%
+  ggplot(aes(x = reorder(pathway, -p_value), y = -log10(p_value))) +
+  geom_col(fill = "darkolivegreen3") +
+  geom_hline(yintercept = -log10(0.05), linetype = "dashed", color = "gray40") +
+  labs(title = "Toy pathway over-representation", x = NULL, y = "-log10 p-value") +
+  theme_minimal(base_size = 11)
+```
+
+# Power analysis (effect size vs sample size)
+```{r fig.width=6, fig.height=4}
+power_grid <- expand_grid(
+  n_per_group = seq(4, 20, by = 2),
+  effect = c(0.3, 0.5, 0.8) # Cohen's d
+) %>%
+  mutate(power = map2_dbl(n_per_group, effect, ~ pwr.t.test(n = .x, d = .y, sig.level = 0.05, type = "two.sample", alternative = "two.sided")$power))
+
+power_grid %>%
+  ggplot(aes(x = n_per_group, y = power, color = factor(effect))) +
+  geom_line(size = 1) +
+  geom_point(size = 2) +
+  scale_color_brewer(palette = "Dark2", name = "Effect size (d)") +
+  scale_y_continuous(labels = scales::percent_format()) +
+  labs(title = "Power curves for two-sample t-test", x = "Samples per group", y = "Power") +
+  theme_minimal(base_size = 11)
+```
+
+# Reproducible workflow sketch (targets)
+Below is a minimal `targets` pipeline outline to show how this analysis could be scripted for reuse; not executed here.
+
+```{r eval=FALSE}
+library(targets)
+tar_option_set(packages = c("tidyverse", "limma", "broom"))
+
+list(
+  tar_target(samples, tibble(sample_id = glue::glue("S{sprintf('%02d', 1:12)}"), condition = rep(c("Control", "Treatment"), each = 6))),
+  tar_target(genes, tibble(gene = paste0("G", 1:10))),
+  tar_target(expr, simulate_expr(samples, genes)),
+  tar_target(clean_expr, clean_expr_fn(expr)),
+  tar_target(ttest_results, run_ttests(clean_expr)),
+  tar_target(limma_res, run_limma(clean_expr, samples)),
+  tar_target(fig_volcano, plot_volcano(ttest_results))
+)
+```
+
+# Interpretation
+The simulated dataset contains 10 genes across two conditions. After filtering out low-expression genes, all remaining genes were tested for differential expression using Welch t-tests with BH correction. Genes G4 and G7 show the largest positive effect sizes and have adjusted p-values below 0.05, consistent with the planted 1.5x upregulation in Treatment. Other genes cluster near the null line with nonsignificant adjusted p-values, indicating no detectable differential expression.
+
+Scientifically, this pattern suggests that the Treatment condition specifically elevates expression of a small subset of genes while leaving most genes unchanged. In a real experiment, these significant genes would be candidates for downstream validation (qPCR, knockout studies) to confirm their functional role in the treatment response.
