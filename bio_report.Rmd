@@ -10,6 +10,7 @@ output:
 
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+source("R/analysis-functions.R")
 ```
 
 # Overview
@@ -61,7 +62,7 @@ expr <- map_dfr(seq_len(nrow(samples)), function(i) {
     gene = genes$gene,
     log2_cpm = rnorm(
       n = nrow(genes),
-      mean = base_means + if_else(samples$condition[i] == "Treatment", treatment_effect, 0),
+      mean = base_means + ifelse(samples$condition[i] == "Treatment", treatment_effect, 0),
       sd = 0.25
     )
   )

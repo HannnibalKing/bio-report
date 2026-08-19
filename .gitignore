@@ -1,0 +1,15 @@
+.Rhistory
+.RData
+.Rproj.user/
+*.html
+*.docx
+*.pdf
+figure/
+figures/
+_cache/
+*_cache/
+_targets/
+renv/library/
+renv/local/
+renv/staging/
+.DS_Store
